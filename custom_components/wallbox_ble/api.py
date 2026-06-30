@@ -8,13 +8,6 @@ import contextlib
 
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
-from bleak.exc import BleakDBusError
-
-from dbus_fast.aio import MessageBus
-from dbus_fast.auth import AuthExternal
-from dbus_fast.constants import BusType
-from dbus_fast.message import Message
-from dbus_fast.service import ServiceInterface, method
 
 from homeassistant.components.bluetooth import async_ble_device_from_address
 
@@ -22,9 +15,36 @@ from .const import LOGGER
 
 
 class WallboxBLEApiConst:
+    # Default (Pulsar Plus / "BgExpress" radio). Overridden at runtime once we
+    # detect which BLE profile the connected charger actually exposes.
     UART_SERVICE_UUID = "331a36f5-2459-45ea-9d95-6142f0c4b307"
     UART_RX_CHAR_UUID = "a9da6040-0823-4995-94ec-9ce41ca28833"
     UART_TX_CHAR_UUID = "a73e9a10-628f-4494-a099-12efaf72258f"
+
+    # Wallbox ships several BLE radio modules across hardware revisions, each
+    # with its own GATT UUIDs but the SAME EaE+JSON application protocol (taken
+    # from the official Android app, enum sr.b). "stream_mode" is the byte to
+    # write to the mode characteristic to put the module into raw-stream mode so
+    # writes to the RX characteristic are forwarded to the charger MCU (Zentri
+    # modules need this; the Pulsar Plus does not).
+    BLE_PROFILES = [
+        {
+            "name": "zentri",
+            "service": "175f8f23-a570-49bd-9627-815a6a27de2a",
+            "rx": "1cce1ea8-bd34-4813-a00a-c76e028fadcb",
+            "tx": "cacc07ff-ffff-4c48-8fae-a9ef71b75e26",
+            "mode": "20b9794f-da1a-4d14-8014-a0fb9cefb2f7",
+            "stream_mode": 0x01,
+        },
+        {
+            "name": "bgexpress",
+            "service": "331a36f5-2459-45ea-9d95-6142f0c4b307",
+            "rx": "a9da6040-0823-4995-94ec-9ce41ca28833",
+            "tx": "a73e9a10-628f-4494-a099-12efaf72258f",
+            "mode": "75a9f022-af03-4e41-b4bc-9de90a47d50b",
+            "stream_mode": None,
+        },
+    ]
 
     GET_AUTOLOCK = "g_alo"
     GET_BATTERY_CONFIG = "r_socr"
@@ -128,33 +148,38 @@ class WallboxBLEApiConst:
     ]
 
 
-class AgentInterface(ServiceInterface):
-    def __init__(self, name):
-        super().__init__(name)
-
-    @method()
-    def RequestAuthorization(self, device: 'o'):
-        LOGGER.debug(f"Initial pairing! Got RequestAuthorization for {device}")
-        return
-
-
 class WallboxBLEApiClient:
 
-    async def pair_client(self):
-        bus = await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
+    def detect_profile(self):
+        """Pick the BLE profile (UUIDs) matching the services this charger exposes."""
+        for profile in WallboxBLEApiConst.BLE_PROFILES:
+            if self.client.services.get_service(profile["service"]) is not None:
+                self.service_uuid = profile["service"]
+                self.rx_uuid = profile["rx"]
+                self.tx_uuid = profile["tx"]
+                self.mode_uuid = profile["mode"]
+                self.stream_mode = profile["stream_mode"]
+                LOGGER.debug(f"Detected BLE profile '{profile['name']}' for {self.address}")
+                return
+        LOGGER.debug(f"No known BLE profile matched; using default UUIDs for {self.address}")
 
-        interface = AgentInterface('org.bluez.Agent1')
-        bus.export('/wallbox/agent', interface)
+    async def authenticate(self):
+        """Replicate the app's session login.
 
-        introspection = await bus.introspect('org.bluez', '/org/bluez')
-        obj = bus.get_proxy_object('org.bluez', '/org/bluez', introspection)
-        agent_manager = obj.get_interface('org.bluez.AgentManager1')
-
-        await agent_manager.call_register_agent("/wallbox/agent", "NoInputNoOutput")
-
-        await self.client.pair()
-
-        bus.disconnect()
+        The charger expects a SET_USER ("suser") command carrying its own user
+        id before it accepts control commands. We read that id back from the
+        status response (r_dat -> "usid"). No PIN/bonding is involved.
+        """
+        try:
+            ok, data = await self.async_get_data()
+            if ok and isinstance(data, dict) and data.get("usid") is not None:
+                usid = data["usid"]
+                ok2, _ = await self.request(WallboxBLEApiConst.SET_USER, usid)
+                LOGGER.debug(f"Authenticated session with usid={usid} ok={ok2}")
+            else:
+                LOGGER.debug("No usid in status; skipping session auth")
+        except Exception as e:
+            LOGGER.debug(f"Authenticate failed: {e}")
 
     async def run_ble_client(self):
         async def callback_handler(sender, data):
@@ -173,18 +198,47 @@ class WallboxBLEApiClient:
                 device = async_ble_device_from_address(self.hass, self.address, connectable=True)
                 if not device:
                     raise Exception("No device found")
-                async with BleakClient(device, disconnected_callback=disconnected_callback) as self.client:
-                    LOGGER.debug("Connected!")
+                # Use bleak_retry_connector so the connection is established
+                # reliably AND all GATT services are fully resolved before we
+                # try to use the UART characteristics (otherwise start_notify
+                # fails with CharacteristicNotFound on a freshly connected link).
+                self.client = await establish_connection(
+                    BleakClient,
+                    device,
+                    self.address,
+                    disconnected_callback=disconnected_callback,
+                )
+                LOGGER.debug("Connected!")
+                # Detect which BLE radio profile this charger exposes and use
+                # its UUIDs for the rest of the session.
+                self.detect_profile()
+                # IMPORTANT: replicate the exact order the official app uses, as
+                # captured from a BLE HCI snoop. The charger does NOT use BLE
+                # bonding/pairing; instead the command characteristic only
+                # accepts writes once (1) notifications are enabled on the TX
+                # characteristic and (2) the module has been switched to STREAM
+                # mode. Doing these in the wrong order yields Write Not Permitted.
+                # 1) enable notifications first
+                await self.client.start_notify(self.tx_uuid, callback_handler)
+                # 2) then switch the (Zentri) radio into raw STREAM mode
+                if self.stream_mode is not None and self.mode_uuid:
                     try:
-                        await self.client.pair()
-                    except NotImplementedError:
-                        # Ugly hack until we wait for HA pairing support to land
-                        await self.client._backend._client.bluetooth_device_pair(self.client._backend._address_as_int)
-                    await self.client.start_notify(WallboxBLEApiConst.UART_TX_CHAR_UUID, callback_handler)
-                    await disconnected_event.wait()
+                        await self.client.write_gatt_char(self.mode_uuid, bytes([self.stream_mode]), True)
+                        LOGGER.debug(f"Set stream mode {self.stream_mode} on {self.mode_uuid}")
+                    except Exception as e:
+                        LOGGER.debug(f"Failed to set stream mode: {e}")
+                # 3) authenticate the session (charger expects "suser" with its
+                # own user id, which we read back from r_dat) so that control
+                # commands (lock, charge current, ...) are accepted.
+                await self.authenticate()
+                await disconnected_event.wait()
             except Exception as e:
                 LOGGER.debug(f"Error: {type(e)}, {e}")
                 await asyncio.sleep(1.0)
+            finally:
+                if self.client is not None:
+                    with contextlib.suppress(Exception):
+                        await self.client.disconnect()
 
             self.client = None
             disconnected_event.clear()
@@ -199,6 +253,13 @@ class WallboxBLEApiClient:
     async def create(cls, hass, address):
         self = WallboxBLEApiClient()
         self.client = None
+        # BLE profile UUIDs; default to the Pulsar Plus profile and refine once
+        # connected via detect_profile().
+        self.service_uuid = WallboxBLEApiConst.UART_SERVICE_UUID
+        self.rx_uuid = WallboxBLEApiConst.UART_RX_CHAR_UUID
+        self.tx_uuid = WallboxBLEApiConst.UART_TX_CHAR_UUID
+        self.mode_uuid = None
+        self.stream_mode = None
         self.rx_queue = asyncio.Queue()
         self.hass = hass
         self.address = address
@@ -233,8 +294,14 @@ class WallboxBLEApiClient:
 
         request_id = random.randint(1, 999)
 
-        uart_service = self.client.services.get_service(WallboxBLEApiConst.UART_SERVICE_UUID)
-        rx_char = uart_service.get_characteristic(WallboxBLEApiConst.UART_RX_CHAR_UUID)
+        uart_service = self.client.services.get_service(self.service_uuid)
+        if uart_service is None:
+            # Services not (yet) resolved - usually because pairing/bonding has
+            # not completed. Avoid raising so the coordinator just reports the
+            # device as unavailable instead of logging a traceback every poll.
+            LOGGER.debug("UART service not found yet (not paired/resolved?)")
+            return False, None
+        rx_char = uart_service.get_characteristic(self.rx_uuid)
 
         payload = {"met": method, "par": parameter, "id": request_id}
 
@@ -245,7 +312,16 @@ class WallboxBLEApiClient:
 
         self.clear_rx_queue()
         try:
-            await asyncio.wait_for(self.client.write_gatt_char(rx_char, data, True), 2)
+            # The charger's command characteristic is a raw UART stream that
+            # only accepts small ATT writes; a single large write is rejected
+            # with Write Not Permitted. The official app always splits the frame
+            # into 20-byte chunks (it keeps the default 23-byte ATT MTU), so we
+            # do the same regardless of the negotiated MTU.
+            chunk = 20
+            for i in range(0, len(data), chunk):
+                await asyncio.wait_for(
+                    self.client.write_gatt_char(rx_char, data[i:i + chunk], True), 2
+                )
         except Exception as e:
             LOGGER.error(f"Failed to write to Bluetooth {e=}")
             return False, None
