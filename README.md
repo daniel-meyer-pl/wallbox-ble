@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="wallbox-white.svg">
+    <img src="wallbox.svg" alt="Wallbox BLE" width="150">
+  </picture>
+</p>
+
 # Wallbox BLE for Home Assistant
 
 Local control of a Wallbox charger over Bluetooth Low Energy (BLE) — no cloud, no
