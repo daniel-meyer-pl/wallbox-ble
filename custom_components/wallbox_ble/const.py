@@ -5,4 +5,4 @@ LOGGER: Logger = getLogger(__package__)
 
 NAME = "Wallbox BLE"
 DOMAIN = "wallbox_ble"
-VERSION = "0.1.0"
+VERSION = "0.2.0"

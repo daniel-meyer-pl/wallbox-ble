@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -13,6 +14,11 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .api import WallboxBLEApiClient, WallboxBLEApiConst
 from .const import DOMAIN, LOGGER
+
+# Variant B safety net: if the BLE link stays dead even after the client's own
+# reconnect attempts (variant A in api.py), reload the whole config entry once.
+# Longer than STALE_RECONNECT_S so a normal reconnect never trips it.
+SELF_RELOAD_STALE_S = 180
 
 
 class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
@@ -38,6 +44,8 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         self.status = ""
         self.status_code = 0
         self.available = False
+        self._last_success_mono = None
+        self._reload_scheduled = False
 
     @classmethod
     async def create(cls, hass, address):
@@ -51,8 +59,26 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
 
         async_call_later(self.hass, delay, wrap)
 
+    def _check_self_heal(self):
+        """Reload the config entry if the link has been dead too long (variant B)."""
+        now = time.monotonic()
+        if self._last_success_mono is None:
+            self._last_success_mono = now
+            return
+        if (now - self._last_success_mono > SELF_RELOAD_STALE_S
+                and not self._reload_scheduled):
+            self._reload_scheduled = True
+            LOGGER.warning(
+                "BLE unrecoverable for >%ss; reloading config entry",
+                SELF_RELOAD_STALE_S,
+            )
+            self.hass.async_create_task(
+                self.hass.config_entries.async_reload(self.config_entry.entry_id)
+            )
+
     async def _async_update_data(self):
         if not self.wb.ready:
+            self._check_self_heal()
             return {}
 
         if self.max_charge_current == 0:
@@ -64,6 +90,8 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         ok, data = await self.wb.async_get_data()
         if ok:
             LOGGER.debug("Update done")
+            self._last_success_mono = time.monotonic()
+            self._reload_scheduled = False
             self.status_code = data.get("st", 0)
             self.locked = self.status_code == 6
             self.charge_current = data.get("cur", 6)
@@ -72,6 +100,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             return data
         else:
             self.available = False
+            self._check_self_heal()
 
     async def async_set_parameter(self, parameter, value):
         ok, _ = await self.wb.request(parameter, value)

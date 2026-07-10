@@ -13,6 +13,14 @@ from homeassistant.components.bluetooth import async_ble_device_from_address
 
 from .const import LOGGER
 
+# BLE link self-heal (variant A): while "connected", wake every
+# HEALTH_CHECK_INTERVAL to check liveness, and force a fresh reconnect if no
+# successful read has landed for STALE_RECONNECT_S. Needed because a silent link
+# death may never trigger bleak's disconnected_callback, leaving run_ble_client
+# blocked forever. The coordinator polls every 10 s, so 60 s ~= 6 missed reads.
+HEALTH_CHECK_INTERVAL = 15
+STALE_RECONNECT_S = 60
+
 
 class WallboxBLEApiConst:
     # Default (Pulsar Plus / "BgExpress" radio). Overridden at runtime once we
@@ -231,7 +239,24 @@ class WallboxBLEApiClient:
                 # own user id, which we read back from r_dat) so that control
                 # commands (lock, charge current, ...) are accepted.
                 await self.authenticate()
-                await disconnected_event.wait()
+                # Mark the link healthy on (re)connect.
+                self.last_success = asyncio.get_running_loop().time()
+                # Variant A: do NOT block forever on disconnected_callback (it may
+                # never fire on a silent link death). Wake periodically and force a
+                # reconnect if no successful read landed for STALE_RECONNECT_S.
+                while not disconnected_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            disconnected_event.wait(), timeout=HEALTH_CHECK_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        idle = asyncio.get_running_loop().time() - self.last_success
+                        if idle > STALE_RECONNECT_S:
+                            LOGGER.warning(
+                                "BLE link stale (%.0fs without data); forcing reconnect",
+                                idle,
+                            )
+                            break
             except Exception as e:
                 LOGGER.debug(f"Error: {type(e)}, {e}")
                 await asyncio.sleep(1.0)
@@ -263,6 +288,7 @@ class WallboxBLEApiClient:
         self.rx_queue = asyncio.Queue()
         self.hass = hass
         self.address = address
+        self.last_success = 0.0
         self.client_task = asyncio.create_task(self.run_ble_client())
         return self
 
@@ -329,6 +355,7 @@ class WallboxBLEApiClient:
         try:
             response = await asyncio.wait_for(self.get_parsed_response(request_id), 2)
             LOGGER.debug("Got response!")
+            self.last_success = asyncio.get_running_loop().time()
             return True, response
         except asyncio.TimeoutError:
             LOGGER.debug("No response!")
